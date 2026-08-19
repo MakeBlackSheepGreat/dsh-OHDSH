@@ -90,11 +90,10 @@ static void InjectBusyboxEnv(const std::string& dshDir) {
         closedir(dir);
     }
 
-    // PATH：hnp/系统工具优先（鸿蒙沙箱禁止 exec filesDir 下 ELF，
-    // busybox 二进制不可执行；/data/service/hnp/bin 与 /system/bin 可 exec），
-    // busybox 目录保留在后，最后保留原有 PATH。
+    // PATH：仅使用鸿蒙沙箱允许执行的系统目录。
+    // filesDir 下的 busybox ELF 可读但不可 exec，放入 PATH 会产生误导性的
+    // EACCES/EPERM；dsh-bash-local 已固定使用 hnp bash，pnpm 插件走同进程 JS。
     std::string path = "/data/service/hnp/bin:/system/bin:/system/xbin";
-    path = path + ":" + busyboxDir;
     const char* oldPath = std::getenv("PATH");
     if (oldPath != nullptr && *oldPath != '\0') {
         path = path + ":" + oldPath;
@@ -106,22 +105,12 @@ static void InjectBusyboxEnv(const std::string& dshDir) {
     setenv("SHELL", "/data/service/hnp/bin/bash", 1);
     setenv("TERM", "xterm", 1);
 
-    // pnpm standalone（dsh plugin 前向器依赖）：<filesDir>/pnpm/pnpm
-    // 沙箱无 node 可执行，内置 linuxstatic-arm64 SEA；chmod 后加入 PATH。
+    // HOME：filesDir/home，可写且与 DSH 数据同区
     std::string filesDir = dshDir;
     std::string::size_type pos = filesDir.rfind('/');
     if (pos != std::string::npos) {
         filesDir = filesDir.substr(0, pos);
     }
-    std::string pnpmDir = filesDir + "/pnpm";
-    std::string pnpmBin = pnpmDir + "/pnpm";
-    if (access(pnpmBin.c_str(), F_OK) == 0) {
-        chmod(pnpmBin.c_str(), 0755);
-        path = pnpmDir + ":" + path;
-        setenv("PATH", path.c_str(), 1);
-    }
-
-    // HOME：filesDir/home，可写且与 DSH 数据同区
     std::string home = filesDir + "/home";
     mkdir(home.c_str(), 0700);
     setenv("HOME", home.c_str(), 1);
@@ -131,7 +120,7 @@ static void InjectBusyboxEnv(const std::string& dshDir) {
  * 启动自检：fork+execv 验证 busybox sh 与 pnpm standalone 在沙箱内可执行。
  * 输出写入 stderr（已重定向到 node-*.log），供 ArkTS dumpNodeLogs 回读确认。
  */
-static void RunSelfCheck(const std::string& busyboxDir, const std::string& pnpmDir) {
+static void RunSelfCheck() {
     auto runCmd = [](const std::string& exe, const std::vector<std::string>& args) {
         pid_t pid = fork();
         if (pid == 0) {
@@ -155,10 +144,7 @@ static void RunSelfCheck(const std::string& busyboxDir, const std::string& pnpmD
             fflush(stderr);
         }
     };
-    std::string sh = busyboxDir + "/sh";
-    runCmd(sh, {"-c", "echo BASH_SELFTEST_OK"});
-    std::string pnpm = pnpmDir + "/pnpm";
-    runCmd(pnpm, {"--version"});
+    runCmd("/data/service/hnp/bin/bash", {"-c", "echo HNP_BASH_SELFTEST_OK"});
     // 对照：系统自带二进制（沙箱是否允许 exec 系统域文件）
     runCmd("/system/bin/toybox", {"--version"});
     runCmd("/system/bin/sh", {"-c", "echo SYS_SH_OK"});
@@ -224,12 +210,9 @@ extern "C" __attribute__((visibility("default"))) void Main() {
     fprintf(stderr, "=== libdsh_host Main() pid=%d dshDir=%s ===\n", getpid(), dshDir.c_str());
     fflush(stderr);
 
-    // 启动自检：验证 busybox sh 与 pnpm 可 spawn（输出已重定向到本 log 文件）
-    {
-        std::string bbDir = filesDir + "/busybox";
-        std::string pmDir = filesDir + "/pnpm";
-        RunSelfCheck(bbDir, pmDir);
-    }
+    // 启动自检：只验证设备允许执行的系统 shell，避免把 filesDir ELF
+    // 的系统级拒绝误报为应用启动错误。
+    RunSelfCheck();
 
     std::string bin = dshDir + "/node_modules/@deepseek-ai/dsh/lib/bin.js";
     // argv: node --jitless --expose-internals <dsh bin> web
@@ -245,5 +228,7 @@ extern "C" __attribute__((visibility("default"))) void Main() {
     argv.push_back(const_cast<char*>("--expose-internals"));
     argv.push_back(const_cast<char*>(bin.c_str()));
     argv.push_back(const_cast<char*>("web"));
-    RunEmbeddedNode(argv);
+    const int nodeExitCode = RunEmbeddedNode(argv);
+    fprintf(stderr, "=== libdsh_host node exit=%d ===\n", nodeExitCode);
+    fflush(stderr);
 }

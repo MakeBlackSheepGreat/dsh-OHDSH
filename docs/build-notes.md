@@ -29,7 +29,7 @@ node '<devtools-hvigor-root>/bin/hvigor.js' assembleHap --no-daemon
 
 ## DSH 运行环境准备
 
-- `scripts/prepare-dsh-env.sh`：npm 安装 DSH → rawfile/dsh（gitignore）
+- `scripts/prepare-dsh-env.sh`：npm 安装 DSH 与 `dshmarket@1.13.1` → rawfile/dsh（gitignore）
 - `scripts/fetch-libnode.sh`：下载 libnode.so → entry/libs/arm64-v8a/
 - `scripts/fetch-busybox.sh`：下载 busybox → rawfile/busybox/
 - `scripts/apply-dsh-ohos-adapt.sh`：对 DSH 环境应用 OpenHarmony 适配

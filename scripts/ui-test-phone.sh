@@ -237,9 +237,15 @@ timeout 15 "$HDC" -t "$TARGET" shell aa start -a EntryAbility -b com.hdsh.agenti
 echo "[ui-test-phone] 等待 DSH server 就绪..."
 READY=0
 for i in $(seq 1 40); do
-  if timeout 10 "$HDC" -t "$TARGET" shell "hilog -D 1 --tail=500 2>/dev/null | grep -q 'DSH server 就绪'" 2>/dev/null; then
-    READY=1
-    break
+  READY_LAYOUT="$(dump_layout "ready${i}")"
+  if [ -n "$READY_LAYOUT" ]; then
+    READY_SIZE="$(web_size "$READY_LAYOUT")"
+    READY_WIDTH="${READY_SIZE%% *}"
+    READY_HEIGHT="${READY_SIZE##* }"
+    if [ "${READY_WIDTH:-0}" -gt 0 ] && [ "${READY_HEIGHT:-0}" -gt 0 ]; then
+      READY=1
+      break
+    fi
   fi
   sleep 3
 done
@@ -337,6 +343,51 @@ if [ -n "$JPC" ]; then
   else
     echo "[ui-test-phone] PASS: PC 断点白屏回归——主列可见（关键文本 = $MPC，ArkWeb 宽 = ${ABC}px）"
   fi
+fi
+
+# 4.5.5 bash cwd：部署后的 dsh-bash-local 必须带工作目录恢复补丁。
+BLF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh-bash-local/lib/index.js"
+if timeout 15 "$HDC" -t "$TARGET" shell "grep -F -q 'HDSH 鸿蒙适配：spawn 前显式 cd' $BLF 2>/dev/null"; then
+  echo "[ui-test-phone] PASS: bash cwd 恢复补丁已部署"
+else
+  echo "[ui-test-phone] FAIL: bash cwd 恢复补丁未部署"
+  REGRESSION_OK=0
+fi
+
+# 4.5.6 三个内置插件：市场、配置编辑器、移动端 UI 与 profile 迁移实现必须同时部署。
+# profile/package.json 位于应用私有 filesDir，HDC shell 无读取权限。用已部署的
+# dsh-app-boot 迁移实现和本轮“DSH server 就绪”共同验证，避免把权限拒绝误报为迁移失败。
+MPF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/dshmarket/lib/index.js"
+MPCF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/dshmarket/cordis.patch.yml"
+MCLI="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/dshmarket/lib/dsh-cli.js"
+MWORKER="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/dshmarket/lib/hdsh-dsh-plugin-worker.cjs"
+MPLUGIN="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh/lib/plugin-9h8shc4d.js"
+MBF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js"
+MLF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@dsh-market/plugin"
+CEF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/hdsh-config-editor/lib/index.js"
+CEC="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/hdsh-config-editor/client/client.js"
+MNF="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@dsh-external/dsh-mobile-nav/lib/index.js"
+MNC="/data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@dsh-external/dsh-mobile-nav/lib/client.js"
+MARKET_PACKAGE="$(timeout 15 "$HDC" -t "$TARGET" shell "test -f $MPF && test -f $MPCF && test -f $MCLI && test -f $MWORKER && test -f $MPLUGIN && grep -F -q '\"pnpm\": \"10.6.3\"' /data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh/package.json && grep -F -q '\"@earendil-works/pi-ai\": \"0.82.1\"' /data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh/package.json && grep -F -q 'HDSH 鸿蒙适配：pnpm Worker 临时目录' $MPLUGIN && grep -F -q 'os.tmpdir = () => tempDir' $MPLUGIN && grep -F -q 'const bundledPnpmCli = join(process.cwd(), \"dsh\", \"node_modules\", \"pnpm\", \"dist\", \"pnpm.cjs\")' $MPLUGIN && grep -F -q 'HDSH 鸿蒙适配：dshmarket Worker CLI bridge v11' $MCLI && grep -F -q 'new Worker(workerPath, { workerData: { bin: dshBin, args }, stdout: true, stderr: true })' $MCLI && printf 1" | tr -d '\r')"
+BUILTIN_EDITOR="$(timeout 15 "$HDC" -t "$TARGET" shell "test -f $CEF && test -f $CEC && grep -F -q 'withFileLock' $CEF && grep -F -q 'writeFileAtomic' $CEF && grep -F -q 'id: \"hdsh-config-editor\"' $CEC && printf 1" | tr -d '\r')"
+BUILTIN_MOBILE="$(timeout 15 "$HDC" -t "$TARGET" shell "test -f $MNF && test -f $MNC && grep -F -q 'name\": \"@dsh-external/dsh-mobile-nav\"' /data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@dsh-external/dsh-mobile-nav/package.json && grep -F -q 'data-mobile-nav=\"frame\"' $MNC && printf 1" | tr -d '\r')"
+MARKET_MIGRATION="$(timeout 15 "$HDC" -t "$TARGET" shell "grep -F -c 'HDSH profile-managed market seed v2' $MBF && grep -F -q 'function seedProfilePackageClosure' $MBF && grep -F -q 'dependencyClosureVersion !== 2' $MBF && grep -F -q 'const profileManaged = packageName === \"dshmarket\" || packageName === \"@dsh-external/dsh-mobile-nav\"' $MBF && grep -F -q '\"hdsh-config-editor\": \"1.0.0\"' /data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh/package.json && grep -F -q '\"@dsh-external/dsh-mobile-nav\": \"1.0.0\"' /data/app/el2/100/base/com.hdsh.agentic/haps/entry/files/dsh/node_modules/@deepseek-ai/dsh/package.json && test ! -e $MLF" | tr -d '\r')"
+if [ "${MARKET_PACKAGE:-0}" -ge 1 ] && [ "${BUILTIN_EDITOR:-0}" -ge 1 ] && [ "${BUILTIN_MOBILE:-0}" -ge 1 ] && [ "${MARKET_MIGRATION:-0}" -ge 1 ]; then
+  echo "[ui-test-phone] PASS: dshmarket、配置编辑器、dsh-web-mobile 与 profile 托管预装迁移已部署"
+else
+  echo "[ui-test-phone] FAIL: 内置插件部署不完整（market=${MARKET_PACKAGE:-0}, editor=${BUILTIN_EDITOR:-0}, mobile=${BUILTIN_MOBILE:-0}, migration=${MARKET_MIGRATION:-0}）"
+  REGRESSION_OK=0
+fi
+
+# 4.5.4 ArkWeb DOM Storage：Release modules.abc 会删除方法名字符串，不能用
+# strings 反查配置。这里检查随本轮成功编译、安装的 ArkTS 源码配置。
+WEB_SOURCE="$ROOT/entry/src/main/ets/pages/hdsh/HdshWebPage.ets"
+DOM_STORAGE="$(grep -F -c '.domStorageAccess(true)' "$WEB_SOURCE" 2>/dev/null | tr -d '\r')"
+if [ "${DOM_STORAGE:-0}" -ge 1 ]; then
+  echo "[ui-test-phone] PASS: ArkWeb DOM Storage 配置参与本轮构建（localStorage 回归）"
+else
+  echo "[ui-test-phone] FAIL: ArkWeb DOM Storage 源码配置缺失，DSH 状态持久化可能失效"
+  REGRESSION_OK=0
 fi
 
 if [ "$REGRESSION_OK" != "1" ]; then PASS_ALL=0; fi

@@ -13,6 +13,7 @@
 # ============================================================
 set -e
 DSH_DIR="${1:?usage: apply-dsh-ohos-adapt.sh <dsh-env-dir>}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NO_BASH=0
 if [ "$2" = "--no-bash" ]; then NO_BASH=1; fi
 cd "$DSH_DIR"
@@ -91,7 +92,7 @@ const walk = (d) => {
   }
 };
 walk(path.join(root, 'node_modules'));
-// busybox 已提供 bash 环境（DshBootstrap 解压 + PATH 注入），tool-bash/tool-terminal 保留启用。
+// 鸿蒙应用沙箱禁止直接执行 filesDir 内 ELF；tool-bash/tool-terminal 使用系统 hnp bash。
 // 沙箱链（Landlock/权限预设）在鸿蒙沙箱中无意义，继续禁用；--no-bash 时一并禁用 bash 工具。
 // 注意：sandbox-policy 不能进 disableIds——tool-bash 要求 ctx.sandboxPolicy，
 // 循环给 id 补 disabled: true 会让它被禁用（rc.6 的 mode 正则恰好删掉了
@@ -141,11 +142,11 @@ for(let i=0;i<lines.length;i++){
 "
 done
 
-echo "[4/4] bash 环境检查 (busybox)..."
+echo "[4/4] bash 环境检查 (system hnp bash)..."
 if [ "$NO_BASH" = "1" ]; then
   echo "  --no-bash: tool-bash/tool-terminal 已禁用"
 else
-  echo "  busybox 模式: tool-bash/tool-terminal 保留启用，bash 由 filesDir/busybox 软链提供"
+  echo "  bash 模式: tool-bash/tool-terminal 使用系统 hnp bash"
 fi
 
 echo "[5/5] HDSH 鸿蒙沙箱适配 patch (bash/fs 注册, sandboxMode, TMPDIR, symlink 降级, manifest)..."
@@ -204,18 +205,20 @@ if (fs.existsSync(bashLocal)) {
   t = t.replaceAll('"bash",\n\t\t\t"-c"', '"/data/service/hnp/bin/bash",\n\t\t\t"-c"');
   // HDSH 鸿蒙适配：appspawn 继承的 cwd 可能让 bash 的 getcwd() 返回 EACCES；
   // 在 shell 内显式 cd 到同一工作目录，恢复 pwd、无参数 ls 等相对路径操作。
-  const spawnCwdAnchor = `\t\treturn {
-\t\t\targv,
-\t\t\tcwd: spec.workdir,`;
-  const spawnCwdPatch = `\t\tconst shellWorkdir = spec.workdir.replaceAll(String.fromCharCode(39), String.fromCharCode(39, 34, 39, 34, 39));
-\t\tconst spawnArgv = argv.length >= 3 && argv[0] === "bash" && argv[1] === "-c"
+  // npm 包在 Windows 工作区可能使用 CRLF；shell argv 也已在上面的替换
+  // 中变为绝对 hnp bash，不能依赖 argv[0] === "bash"。
+  const spawnCwdPattern = /\n\t\treturn \{\r?\n\t\t\targv,\r?\n\t\t\tcwd: spec\.workdir,/;
+  const spawnCwdPatch = `
+\t\t// HDSH 鸿蒙适配：spawn 前显式 cd，修复继承 cwd 的 getcwd EACCES。
+\t\tconst shellWorkdir = spec.workdir.replaceAll(String.fromCharCode(39), String.fromCharCode(39, 34, 39, 34, 39));
+\t\tconst spawnArgv = argv.length >= 3 && argv[1] === "-c"
 \t\t\t? [argv[0], argv[1], "cd '" + shellWorkdir + "' 2>/dev/null || exit 1; " + argv[2], ...argv.slice(3)]
 \t\t\t: argv;
 \t\treturn {
 \t\t\targv: spawnArgv,
 \t\t\tcwd: spec.workdir,`;
-  if (t.includes(spawnCwdAnchor) && !t.includes('HDSH 鸿蒙适配：spawn 前显式 cd')) {
-    t = t.replace(spawnCwdAnchor, spawnCwdPatch);
+  if (spawnCwdPattern.test(t) && !t.includes('HDSH 鸿蒙适配：spawn 前显式 cd')) {
+    t = t.replace(spawnCwdPattern, spawnCwdPatch);
   }
   fs.writeFileSync(bashLocal, t);
   console.log('dsh-bash-local: sandboxMode + hnp bash + cwd recovery patched');
@@ -326,6 +329,49 @@ if (fs.existsSync(dshManifestTs)) {
     manifest.dependencies['typescript'] = '^5.9.3';
     fs.writeFileSync(dshManifestTs, JSON.stringify(manifest, null, 2) + '\n');
     console.log('dsh manifest: typescript added to dependencies');
+  }
+}
+
+// 3.7.1) dshmarket 作为 DSH 内置 Web bundle：将其加入 dsh 依赖闭包，
+//          healProfilesModuleFallback 才会把插件及其依赖复制到
+//          $DSH_HOME/profiles/node_modules，供 Web profile 的 bare module loader 解析。
+const marketManifestPath = path.join(nm, 'dshmarket/package.json');
+const dshManifestMarket = path.join(nm, '@deepseek-ai/dsh/package.json');
+if (fs.existsSync(marketManifestPath) && fs.existsSync(dshManifestMarket)) {
+  const marketManifest = JSON.parse(fs.readFileSync(marketManifestPath, 'utf-8'));
+  const manifest = JSON.parse(fs.readFileSync(dshManifestMarket, 'utf-8'));
+  const marketVersion = String(marketManifest.version ?? '1.13.1');
+  manifest.dependencies = manifest.dependencies ?? {};
+  if (manifest.dependencies['dshmarket'] !== marketVersion) {
+    manifest.dependencies['dshmarket'] = marketVersion;
+    fs.writeFileSync(dshManifestMarket, JSON.stringify(manifest, null, 2) + '\n');
+    console.log('dsh manifest: dshmarket added to dependency closure');
+  }
+}
+
+// 3.7.2) dsh-app-boot：Web profile 默认挂载 dshmarket，并迁移既有 profile。
+//          仅升级 rawfile 不会重建 $DSH_HOME/profiles/web/package.json；因此
+//          启动时补齐 bundle，保留用户已有依赖和自定义 patch。
+const appBootMarket = path.join(nm, '@deepseek-ai/dsh-app-boot/lib/index.js');
+if (fs.existsSync(appBootMarket)) {
+  let t = fs.readFileSync(appBootMarket, 'utf-8');
+  const layersAnchor = '\tconst layers = (normalizeShippedProfile(name, dir, readProfileManifest(binName, dir)).dsh?.profile?.bundles ?? []).map((packageName) => {';
+  const migrationStart = t.indexOf('\t// HDSH 内置 dshmarket Web profile v');
+  const migrationEnd = migrationStart === -1 ? -1 : t.indexOf(layersAnchor, migrationStart);
+  if (migrationEnd !== -1) {
+    t = t.slice(0, migrationStart) + t.slice(migrationEnd);
+  }
+  if (!t.includes('HDSH 内置 dshmarket Web profile v3')) {
+    t = t.replace(
+      'web: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"],',
+      '// HDSH 内置 dshmarket Web profile（首次初始化自动加载插件市场）。\n\tweb: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dshmarket"],'
+    );
+    const migration = `\t// HDSH 内置 dshmarket Web profile v3：确认新包可解析后迁移已有\n\t// web profile，并移除已卸载市场的残留 bundle，保留用户其余配置。\n\tconst hdshMarketManifest = readProfileManifest(binName, dir);\n\tconst hdshExistingBundles = hdshMarketManifest.dsh?.profile?.bundles ?? [];\n\tconst hdshLegacyMarketBundle = "@dsh-market/plugin";\n\tconst hdshMigratedBundles = hdshExistingBundles.filter((packageName) => packageName !== hdshLegacyMarketBundle);\n\tif (name === "web" && (hdshMigratedBundles.length !== hdshExistingBundles.length || !hdshMigratedBundles.includes("dshmarket"))) {\n\t\ttry {\n\t\t\tresolveBundleDir(binName, "dshmarket", installAnchor, dir);\n\t\t\twriteProfileManifest(dir, {\n\t\t\t\t...hdshMarketManifest,\n\t\t\t\tdsh: {\n\t\t\t\t\t...hdshMarketManifest.dsh,\n\t\t\t\t\tprofile: {\n\t\t\t\t\t\t...hdshMarketManifest.dsh?.profile,\n\t\t\t\t\t\tbundles: hdshMigratedBundles.includes("dshmarket") ? hdshMigratedBundles : [...hdshMigratedBundles, "dshmarket"]\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t});\n\t\t} catch (error) {\n\t\t\t// 新市场包不可用时不改写 profile，避免丢失可启动配置。\n\t\t}\n\t}\n`;
+    if (t.includes(layersAnchor)) {
+      t = t.replace(layersAnchor, migration + layersAnchor);
+    }
+    fs.writeFileSync(appBootMarket, t);
+    console.log('dsh-app-boot: dshmarket web bundle + profile migration');
   }
 }
 
@@ -536,14 +582,40 @@ if (!fs.existsSync(path.join(PNPM_JS_DEST, 'dist/pnpm.cjs'))) {
     }
   }
 }
+// pnpm 必须成为 dsh 运行时依赖。dsh-app-boot 会按 dsh manifest 的依赖闭包
+// 复制 profiles/node_modules fallback；缺少该声明时，Worker 从 fallback dsh
+// 加载 pnpm CLI 会解析到不存在的 profiles/node_modules/pnpm。
+const dshManifestPath = path.join(nm, '@deepseek-ai/dsh/package.json');
+if (fs.existsSync(dshManifestPath) && fs.existsSync(path.join(PNPM_JS_DEST, 'dist/pnpm.cjs'))) {
+  const dshManifest = JSON.parse(fs.readFileSync(dshManifestPath, 'utf-8'));
+  dshManifest.dependencies = dshManifest.dependencies || {};
+  if (dshManifest.dependencies.pnpm !== '10.6.3') {
+    dshManifest.dependencies.pnpm = '10.6.3';
+    fs.writeFileSync(dshManifestPath, JSON.stringify(dshManifest, null, 2) + '\n');
+    console.log('dsh: pnpm added to runtime dependency closure');
+  }
+  const piManifestPath = path.join(nm, '@earendil-works/pi-ai/package.json');
+  if (fs.existsSync(piManifestPath)) {
+    const piVersion = String(JSON.parse(fs.readFileSync(piManifestPath, 'utf-8')).version ?? '0.82.1');
+    if (dshManifest.dependencies['@earendil-works/pi-ai'] !== piVersion) {
+      dshManifest.dependencies['@earendil-works/pi-ai'] = piVersion;
+      fs.writeFileSync(dshManifestPath, JSON.stringify(dshManifest, null, 2) + '\n');
+      console.log('dsh: pi-ai added to runtime dependency closure');
+    }
+  }
+}
 // patch runPlugin：spawnSync("pnpm") -> worker_threads 主进程内执行 pnpm CLI
 const pluginPath = path.join(nm, '@deepseek-ai/dsh/lib/plugin-9h8shc4d.js');
 if (fs.existsSync(pluginPath)) {
   let t = fs.readFileSync(pluginPath, 'utf-8');
   if (!t.includes('HDSH 鸿蒙适配：鸿蒙沙箱禁 exec 子进程 node')) {
     t = t.replace(
+      'import { join, resolve } from "node:path";',
+      'import { dirname, join, resolve } from "node:path";'
+    );
+    t = t.replace(
       'import { spawnSync } from "node:child_process";',
-      'import { Worker } from "node:worker_threads";'
+      'import { fileURLToPath } from "node:url";\nimport { Worker } from "node:worker_threads";'
     );
     const oldRun = `function runPlugin(profile, args) {
 	const dir = resolveProfileDir(profile);
@@ -574,17 +646,16 @@ if (fs.existsSync(pluginPath)) {
 	const before = readProfileManifest(NAME, dir);
 	// HDSH 鸿蒙适配：主进程 worker 执行 pnpm CLI（同进程非子进程 exec，
 	// 绕过 SIGSYS；pnpm CLI 末尾 process.exit 只终止 worker）。
-	const pnpmCli = join(resolve(dirname(fileURLToPath(import.meta.url)), "../../node_modules"), "pnpm/dist/pnpm.cjs");
+	const pnpmCli = join(dirname(fileURLToPath(import.meta.url)), "../../../pnpm/dist/pnpm.cjs");
 	const exitCode = await new Promise((resolvePromise) => {
 		const worker = new Worker(\`
 			const { parentPort, workerData } = require("node:worker_threads");
-			const { join } = require("node:path");
-			process.chdir(workerData.dir);
-			process.argv = [process.execPath, "pnpm", ...workerData.args];
+			process.argv = [process.execPath, "pnpm", "--dir", workerData.dir, ...workerData.args];
 			try {
 				require(workerData.pnpmCli);
 			} catch (error) {
 				parentPort.postMessage({ error: String(error) });
+				process.exitCode = 1;
 			}
 		\`, {
 			eval: true,
@@ -600,9 +671,25 @@ if (fs.existsSync(pluginPath)) {
     }
     // 删除 anchorPathSpec 引用（worker 内已不需要重写相对路径）
     t = t.replace(/args\.map\(\(argument\) => anchorPathSpec\(argument, process\.cwd\(\)\)\)/g, 'args');
-    fs.writeFileSync(pluginPath, t);
     console.log('dsh plugin: runPlugin -> worker_threads pnpm bridge');
   }
+  if (!t.includes('HDSH 鸿蒙适配：pnpm Worker 临时目录')) {
+    const oldWorkerSetup = 'const { parentPort, workerData } = require("node:worker_threads");\n\t\t\tprocess.argv = [process.execPath, "pnpm", "--dir", workerData.dir, ...workerData.args];';
+    const newWorkerSetup = 'const { parentPort, workerData } = require("node:worker_threads");\n\t\t\tconst { mkdirSync } = require("node:fs");\n\t\t\tconst { join } = require("node:path");\n\t\t\t// HDSH 鸿蒙适配：pnpm Worker 临时目录，沙箱没有 /tmp。\n\t\t\tconst tempDir = join(workerData.dir, ".hdsh-pnpm-tmp");\n\t\t\tmkdirSync(tempDir, { recursive: true });\n\t\t\tprocess.env.TMPDIR = tempDir;\n\t\t\tprocess.env.TMP = tempDir;\n\t\t\tprocess.env.TEMP = tempDir;\n\t\t\t// OHOS Node 的 os.tmpdir() 忽略 TMPDIR；pnpm 在载入时会 realpath /tmp。\n\t\t\tconst os = require("node:os");\n\t\t\tos.tmpdir = () => tempDir;\n\t\t\tprocess.argv = [process.execPath, "pnpm", "--dir", workerData.dir, ...workerData.args];';
+    if (t.includes(oldWorkerSetup)) {
+      t = t.replace(oldWorkerSetup, newWorkerSetup);
+      console.log('dsh plugin: pnpm Worker temporary directory patched');
+    }
+  }
+  if (!t.includes('HDSH 鸿蒙适配：优先使用 HAP 内置 pnpm')) {
+    const fallbackPnpmCli = 'const pnpmCli = join(dirname(fileURLToPath(import.meta.url)), "../../../pnpm/dist/pnpm.cjs");';
+    const bundledPnpmCli = '// HDSH 鸿蒙适配：优先使用 HAP 内置 pnpm；profile fallback 不保证包含 pnpm。\n\tconst bundledPnpmCli = join(process.cwd(), "dsh", "node_modules", "pnpm", "dist", "pnpm.cjs");\n\tconst pnpmCli = existsSync(bundledPnpmCli)\n\t\t? bundledPnpmCli\n\t\t: join(dirname(fileURLToPath(import.meta.url)), "../../../pnpm/dist/pnpm.cjs");';
+    if (t.includes(fallbackPnpmCli)) {
+      t = t.replace(fallbackPnpmCli, bundledPnpmCli);
+      console.log('dsh plugin: bundled pnpm CLI path patched');
+    }
+  }
+  fs.writeFileSync(pluginPath, t);
 }
 // patch bin.js：await runPlugin（runPlugin 已改为 async）
 const binPath = path.join(nm, '@deepseek-ai/dsh/lib/bin.js');
@@ -617,6 +704,68 @@ if (fs.existsSync(binPath)) {
     console.log('dsh bin: await runPlugin');
   }
 
+}
+
+// 3.9.1) dshmarket：鸿蒙禁止 Node 子进程执行。市场改为通过 Worker 加载
+//          内置 dsh CLI，CLI 内部继续使用已适配的 pnpm Worker bridge。
+const marketCliPath = path.join(nm, 'dshmarket/lib/dsh-cli.js');
+if (fs.existsSync(marketCliPath)) {
+  const marketWorkerPath = path.join(nm, 'dshmarket/lib/hdsh-dsh-plugin-worker.cjs');
+  const marketWorkerSource = `const { workerData } = require("node:worker_threads");
+const { pathToFileURL } = require("node:url");
+process.argv = [process.execPath, workerData.bin].concat(workerData.args);
+import(pathToFileURL(workerData.bin).href).catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`;
+  fs.writeFileSync(marketWorkerPath, marketWorkerSource);
+  let t = fs.readFileSync(marketCliPath, 'utf-8');
+  if (!t.includes('HDSH 鸿蒙适配：dshmarket Worker CLI bridge v11')) {
+    if (!/import \{ Worker \} from ['"]node:worker_threads['"]/.test(t)) {
+      t = t.replace(
+        /(import \{ spawn \} from ['"]node:child_process['"];)/,
+        '$1\nimport { createRequire } from "node:module";\nimport { Worker } from "node:worker_threads";\nimport { fileURLToPath } from "node:url";'
+      );
+    }
+    t = t.replace('import { pathToFileURL } from "node:url";', 'import { fileURLToPath } from "node:url";');
+    if (!t.includes('fileURLToPath')) {
+      t = t.replace(
+        /(import \{ Worker \} from ['"]node:worker_threads['"];)/,
+        '$1\nimport { fileURLToPath } from "node:url";'
+      );
+    }
+    t = t.replace('const require = createRequire(import.meta.url);', 'const dshRequire = createRequire(import.meta.url);');
+    t = t.replace('require.resolve("@deepseek-ai/dsh/package.json")', 'dshRequire.resolve("@deepseek-ai/dsh/package.json")');
+    if (!t.includes('const dshRequire = createRequire(import.meta.url);')) {
+      t = t.replace(
+        /(import \{ profileDir \} from ['"]\.\/profile\.js['"];)/,
+        '$1\nconst dshRequire = createRequire(import.meta.url);'
+      );
+    }
+    if (!t.includes('let activeWorker = null;')) {
+      t = t.replace('let activeChild = null;', 'let activeChild = null;\nlet activeWorker = null;');
+    }
+    if (!t.includes('void activeWorker.terminate().catch(() => {});')) {
+      t = t.replace(
+        'if (activeChild === null) return false;',
+        'if (activeWorker !== null) {\n        cancelRequested = true;\n        progress.cancelling = true;\n        void activeWorker.terminate().catch(() => {});\n        return true;\n    }\n    if (activeChild === null) return false;'
+      );
+    }
+    const probeStart = t.indexOf('export function probePnpm() {');
+    const probeEnd = t.indexOf('function runQuiet(', probeStart);
+    if (probeStart !== -1 && probeEnd !== -1 && !t.includes('dsh plugin 已通过内置 pnpm Worker bridge')) {
+      t = t.slice(0, probeStart) + 'export function probePnpm() {\n    // HDSH 鸿蒙适配：dsh plugin 已通过内置 pnpm Worker bridge 执行。\n    return Promise.resolve(true);\n}\n' + t.slice(probeEnd);
+    }
+    const runnerStart = t.indexOf('export function runDshPlugin(profile, pluginArgs) {');
+    const runnerEnd = t.indexOf('/**\n * Adapt DSH Desktop', runnerStart);
+    if (runnerStart !== -1 && runnerEnd !== -1) {
+      const runner = `// HDSH 鸿蒙适配：dshmarket Worker CLI bridge v11。\nexport function runDshPlugin(profile, pluginArgs) {\n    const prepared = preparePluginArgs(profileDir(profile), pluginArgs);\n    if ("error" in prepared) {\n        logEvent("error", "install", prepared.error);\n        return Promise.resolve({ exitCode: 1, timedOut: false, stdout: "", stderr: prepared.error, cancelled: false });\n    }\n    const tracker = beginProgress(prepared.target);\n    const dshManifestPath = dshRequire.resolve("@deepseek-ai/dsh/package.json");\n    const dshBin = join(dirname(dshManifestPath), "lib/bin.js");\n    const workerPath = join(dirname(fileURLToPath(import.meta.url)), "hdsh-dsh-plugin-worker.cjs");\n    // 不显式传递 execArgv。Node 允许 Worker 默认继承主进程 V8 配置，\n    // 显式传入 --jitless 会被 Worker 参数校验拒绝。\n    const args = ["plugin", "--profile", profile, ...prepared.args];\n    return new Promise((resolvePromise) => {\n        const worker = new Worker(workerPath, { workerData: { bin: dshBin, args }, stdout: true, stderr: true });\n        activeWorker = worker;\n        cancelRequested = false;\n        let timedOut = false;\n        let workerStdout = "";\n        let workerStderr = "";\n        worker.stdout?.on("data", (chunk) => { workerStdout += String(chunk); });\n        worker.stderr?.on("data", (chunk) => { workerStderr += String(chunk); });\n        const finish = (exitCode, stderr) => {\n            clearTimeout(timer);\n            progress.active = false;\n            progress.cancelling = false;\n            if (activeWorker === worker) activeWorker = null;\n            const failed = exitCode !== 0 || timedOut;\n            const diagnostic = stderr || workerStderr.trim();\n            if (failed) progress.error = tracker.snapshot.error ?? diagnostic;\n            resolvePromise({ exitCode, timedOut, stdout: workerStdout, stderr: diagnostic, cancelled: cancelRequested });\n        };\n        const timer = setTimeout(() => {\n            timedOut = true;\n            void worker.terminate().catch(() => {});\n        }, INSTALL_TIMEOUT_MS);\n        worker.on("exit", (code) => finish(code ?? 1, timedOut ? "dsh plugin command timed out" : ""));\n        worker.on("error", (error) => finish(127, String(error)));\n    });\n}\n`;
+      t = t.slice(0, runnerStart) + runner + t.slice(runnerEnd);
+    }
+    fs.writeFileSync(marketCliPath, t);
+    console.log('dshmarket: OpenHarmony Worker CLI bridge patched');
+  }
 }
 
 // 4) dsh-app-boot：ensureSymlink 在鸿蒙降级为目录复制（沙箱禁 symlink）
@@ -640,6 +789,14 @@ if (fs.existsSync(appBoot)) {
         fs.writeFileSync(appBoot, t);
         console.log('dsh-app-boot: ensureSymlink degrade-to-copy');
       }
+    }
+  }
+  if (!t.includes('HDSH 鸿蒙适配：忽略旧版市场残留的不可用 UI 设置条目')) {
+    const oldProfileReturn = 'const patchPath = join(dir, PROFILE_PATCH_FILENAME);\n\treturn {\n\t\tname,\n\t\tdir,\n\t\tlayers,\n\t\tpatchPath,\n\t\tpatches: options.userLayer !== false && existsSync(patchPath) ? loadOverlayPatches(binName, patchPath) : []\n\t};';
+    const newProfileReturn = 'const patchPath = join(dir, PROFILE_PATCH_FILENAME);\n\tconst userPatches = options.userLayer !== false && existsSync(patchPath) ? loadOverlayPatches(binName, patchPath) : [];\n\t// HDSH 鸿蒙适配：忽略旧版市场残留的不可用 UI 设置条目，不写回用户配置。\n\tconst patches = name === "web" ? userPatches.filter((patch) => {\n\t\tif (!JSON.stringify(patch).includes("@deepseek-ai/dsh-client-ui-settings-ohos")) return true;\n\t\tprocess.stderr.write("dsh: skipped legacy unavailable ui-settings-ohos patch\\n");\n\t\treturn false;\n\t}) : userPatches;\n\treturn {\n\t\tname,\n\t\tdir,\n\t\tlayers,\n\t\tpatchPath,\n\t\tpatches\n\t};';
+    if (t.includes(oldProfileReturn)) {
+      t = t.replace(oldProfileReturn, newProfileReturn);
+      console.log('dsh-app-boot: legacy unavailable UI settings patch filtered');
     }
   }
 }
@@ -689,5 +846,6 @@ if (fs.existsSync(apiProxy)) {
 console.log('HDSH sandbox adaptation applied');
 HDSHPATCHEOF
 node "$HDSH_PATCH"
+node "$SCRIPT_DIR/create-hdsh-config-editor.mjs" "$(pwd)"
 
 echo "✅ DSH OpenHarmony 适配完成。启动: node --expose-internals <dir>/node_modules/@deepseek-ai/dsh/lib/bin.js web"

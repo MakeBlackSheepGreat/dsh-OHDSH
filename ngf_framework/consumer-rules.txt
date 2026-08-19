@@ -1,0 +1,2 @@
+# Consumer rules are intentionally empty. The framework exposes no additional
+# name-preservation requirements to application modules.

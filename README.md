@@ -13,9 +13,12 @@ HDSH 是面向 HarmonyOS Next 的 DSH 运行环境实现。项目以 `entry` 承
 - 支持声明：phone、tablet、2in1、car、tv、wearable
 - 设备回归：主页可见、默认窗口比例正常、PC 断点不白屏
 - 文件搜索 fallback：在 ripgrep 不可用时使用系统 grep，并保持 ERE 正则语义
+- 内置插件市场：使用 `dshmarket@1.13.1`（`dsh-market/dsh-market`），首次 Web profile 初始化自动挂载，插件安装通过鸿蒙 Worker 桥接调用内置 pnpm
 - 公开仓库不包含签名材料、凭据或本机环境文件
 
 当前版本重点是 DSH WebUI 运行闭环与设备适配。ArkTS 原生 harness、设置、工具和 MCP 能力仍按 [迁移方案](docs/migration-plan.md) 继续演进。
+
+设备运行约束：鸿蒙应用沙箱允许读取随包分发的 busybox/pnpm 文件，但禁止直接执行应用文件目录中的 ELF。运行时因此使用系统 hnp bash 与系统工具目录，DSH 插件管理使用同进程内置 pnpm JavaScript 实现；busybox/pnpm 目录仍由准备脚本生成，作为可复现的运行时资源和后续平台适配输入。
 
 ## 目录
 

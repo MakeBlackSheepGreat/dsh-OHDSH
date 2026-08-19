@@ -86,6 +86,7 @@ struct HdshWebPage {
       await WorkspaceAccess.syncAuthorizedToWorkspace(hostCtx);
       // 写入鸿蒙信息 JSON，供 dsh Web UI 的"鸿蒙设置"段展示
       await writeOhosInfo(hostCtx);
+      DshBootstrap.clearNodeLogs(hostCtx);
       await DshBootstrap.launchDsh();
       HdshLogger.info(TAG, '等待 DSH server 就绪...');
       this.ready = await DshBootstrap.waitForServer(120000);
@@ -98,7 +99,12 @@ struct HdshWebPage {
         this.statusText = 'DSH server 启动超时';
         HdshLogger.error(TAG, 'DSH server 启动超时，回读 node 日志');
         await DshBootstrap.dumpNodeLogs(hostCtx);
+        const nodeLogTail: string = DshBootstrap.readNodeLogTail(hostCtx);
+        if (nodeLogTail.length > 0) {
+          this.statusText = 'DSH server 启动失败\n' + nodeLogTail;
+        }
         await DshBootstrap.dumpFallbackDiag(hostCtx);
+        await DshBootstrap.dumpWebProfileManifest(hostCtx);
       }
     } catch (e) {
       const msg: string = e instanceof Error ? e.message : String(e);
@@ -113,6 +119,9 @@ struct HdshWebPage {
         Web({ src: 'http://127.0.0.1:3080', controller: this.controller })
           .width('100%')
           .height('100%')
+          // DSH WebUI uses localStorage for workspace and session snapshots.
+          // ArkWeb requires DOM storage access to be enabled explicitly here.
+          .domStorageAccess(true)
           // HDSH 鸿蒙适配：手机/平板沉浸式——Web 内容扩展到系统栏区域，
           // 安全区避让由 Web 层插件注入的 env(safe-area-inset-*) CSS 处理
           .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])

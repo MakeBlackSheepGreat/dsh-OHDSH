@@ -25,7 +25,7 @@ const SERVER_URL: string = 'http://127.0.0.1:3080';
 // 覆盖安装（install -r）不清应用数据，靠版本文件判断是否需要重新解压，
 // 避免旧环境残留、新环境不更新；会话/工作区/API key 存于 filesDir/home，
 // 不随环境重建而丢失。
-const ENV_VERSION: string = '20260818-23';
+const ENV_VERSION: string = '20260819-54';
 const VERSION_FILE: string = '.hdsh-version';
 
 // busybox：随 HAP 分发（rawfile/busybox/busybox），解压到 filesDir/busybox
@@ -273,6 +273,26 @@ export class DshBootstrap {
     return childProcessManager.startNativeChildProcess('libdsh_host.so:Main', {});
   }
 
+  /** 启动前仅清理上一轮 node 诊断日志，避免超时诊断混入历史进程错误。 */
+  static clearNodeLogs(context: common.UIAbilityContext): void {
+    const logDir: string = context.filesDir + '/log';
+    DshBootstrap.removeDirRecursive(logDir);
+    if (fileIo.accessSync(logDir)) {
+      try {
+        fileIo.rmdirSync(logDir);
+      } catch (e) {
+        HdshLogger.warn(TAG, '删除旧 node 日志目录失败: ' + String(e));
+        return;
+      }
+    }
+    try {
+      fileIo.mkdirSync(logDir);
+      HdshLogger.info(TAG, '已清除上一轮 node 诊断日志');
+    } catch (e) {
+      HdshLogger.warn(TAG, '创建 node 日志目录失败: ' + String(e));
+    }
+  }
+
   /**
    * 诊断：回读 filesDir/log/ 下的 node 子进程日志并打到 hilog。
    * libdsh_host 将 node stdout/stderr 重定向到 <filesDir>/log/node-*.log，
@@ -298,6 +318,31 @@ export class DshBootstrap {
     }
   }
 
+  /** 读取最近 Node 子进程日志的末尾，供启动失败界面显示可操作的根因。 */
+  static readNodeLogTail(context: common.UIAbilityContext): string {
+    const logDir: string = context.filesDir + '/log';
+    let entries: Array<string> = [];
+    try {
+      entries = fileIo.listFileSync(logDir);
+    } catch (e) {
+      return '';
+    }
+    let latest: string = '';
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i].startsWith('node-') && entries[i].endsWith('.log')) {
+        latest = entries[i];
+      }
+    }
+    if (latest.length === 0) return '';
+    try {
+      const content: string = fileIo.readTextSync(logDir + '/' + latest);
+      const maxLength: number = 1200;
+      return content.length > maxLength ? content.slice(content.length - maxLength) : content;
+    } catch (e) {
+      return '';
+    }
+  }
+
   /**
    * 诊断：列出 DSH 源目录与 profiles fallback 目录中 pi-ai 相关路径，
    * 用于定位 .manifest.json 缺失（rawfile 隐藏文件解压丢失或 cpSync 复制问题）。
@@ -317,6 +362,17 @@ export class DshBootstrap {
         continue;
       }
       HdshLogger.error('FallbackDiag', paths[i] + ' => [' + names.join(',') + ']');
+    }
+  }
+
+  /** 诊断：输出当前 Web profile 的插件清单，用于定位某个第三方包的启动失败。 */
+  static async dumpWebProfileManifest(context: common.UIAbilityContext): Promise<void> {
+    const manifestPath: string = context.filesDir + '/home/.dsh/profiles/web/package.json';
+    try {
+      const content: string = fileIo.readTextSync(manifestPath);
+      HdshLogger.error('ProfileDiag', 'web profile manifest: ' + content);
+    } catch (e) {
+      HdshLogger.error('ProfileDiag', 'web profile manifest 不可读: ' + String(e));
     }
   }
 

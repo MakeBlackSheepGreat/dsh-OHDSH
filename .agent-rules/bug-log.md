@@ -22,12 +22,84 @@
 
 ## Bug 列表（新→旧）
 
+### [2026-08-19] Profile 预安装插件在鸿蒙目录复制模式下缺少传递依赖
+- **现象**：覆盖安装后，Web profile 启动阶段曾报 `Cannot find module @deepseek-ai/cordis-plugin-loader`，调用方为 `@deepseek-ai/cordis-plugin-include`。
+- **根因**：鸿蒙应用沙箱不允许创建符号链接，安装依赖 fallback 会退化为目录副本；此前仅复制 `dshmarket` 和移动端插件的包根目录，未复制其 `dependencies`、`optionalDependencies` 与 `peerDependencies` 闭包。
+- **修复**：在 dsh-app-boot 生成代码中增加 `seedProfilePackageClosure()`，以 Node 解析顺序遍历预安装包的完整依赖闭包并复制至 `profiles/web/node_modules`。仅当插件仍存在于 profile dependencies 与 bundles 时补齐，已卸载插件不会恢复。环境版本提升至 `20260819-54`；自动化检查同步验证 `seedProfilePackageClosure` 和 `dependencyClosureVersion = 2` 已部署。
+- **验证**：`node scripts/test-profile-managed-plugins.mjs` 通过，断言 profile 中存在 `cordis-plugin-include` 与 `cordis-plugin-loader`；Release HAP 构建成功并覆盖安装真机；`scripts/ui-test-phone.sh 1 <hdc-target>` 全部通过，DSH 正常监听 `127.0.0.1:3080`。
+- **回归测试**：`scripts/test-profile-managed-plugins.mjs`；`scripts/ui-test-phone.sh` 4.5.6。
+- **状态**：✅ 已修复
+
+### [2026-08-19] 随 HAP 内置的第三方插件无法由插件市场管理
+- **现象**：`dshmarket` 与 `dsh-web-mobile` 虽随应用提供，但未进入用户 profile 的插件清单；市场无法将它们作为已安装插件显示、更新或卸载。
+- **根因**：这两个第三方包仅从应用安装目录解析，未写入 `profiles/web/package.json` 的 dependencies 与 bundles；插件市场只管理 profile 依赖。
+- **修复**：首次加载 Web profile 时，将 `dshmarket` 与 `@dsh-external/dsh-mobile-nav` 及其完整依赖闭包从 HAP 离线缓存复制到 profile 的 `node_modules`，写入依赖和 bundle 清单，并以 profile 优先解析。迁移状态写入 `hdsh.profileManagedSeed.version = 2`，用户卸载后不会在后续启动时重新安装。文本编辑器继续作为应用内置能力。
+- **验证**：`node scripts/test-profile-managed-plugins.mjs` 通过，确认两个包与 `cordis-plugin-include`、`cordis-plugin-loader` 进入 profile、解析路径优先使用 profile，并确认模拟卸载后不再恢复；Release HAP 已覆盖安装真机，`scripts/ui-test-phone.sh 1 <hdc-target>` 全部通过。
+- **回归测试**：`scripts/test-profile-managed-plugins.mjs`；`scripts/ui-test-phone.sh` 4.5.6 断言部署的迁移与 profile-first 解析实现。
+- **状态**：✅ 已修复
+
+### [2026-08-19] 覆盖安装后旧 profile fallback 阻止 DSH 启动
+- **现象**：覆盖安装包含 `dsh-web-mobile` 的 HAP 后，界面停留在“正在启动 DSH 运行时…”，最终显示 `DSH server 启动超时`；日志显示 profile 无法解析当前安装包的依赖，或尝试加载历史 `ui-settings-ohos` 条目。
+- **根因**：HarmonyOS 沙箱不允许创建链接，`healProfilesModuleFallback()` 因而写入目录副本。旧实现将已存在的目录视为有效缓存，HAP 升级后仍保留旧依赖闭包。配置编辑器生成器也未保留旧用户 patch 的过滤逻辑，使历史市场配置中的不可用 `ui-settings-ohos` 条目重新参与加载。
+- **修复**：为 `$DSH_HOME/profiles/node_modules` 增加版本标记；版本不匹配时只清理该安装依赖缓存，再从当前 HAP 依赖闭包重新生成，不影响 profile 内由用户管理的 `node_modules`。将历史 `ui-settings-ohos` patch 过滤逻辑并入生成器，使重新准备离线环境时仍会保留；环境版本提升至 `20260819-50`。
+- **验证**：`node scripts/test-profile-managed-plugins.mjs` 通过，覆盖了 fallback 首次生成、模拟过期缓存重建、插件卸载不复活和旧 patch 过滤；待本轮 Release 真机覆盖安装复验。
+- **回归测试**：`scripts/test-profile-managed-plugins.mjs`；`scripts/ui-test-phone.sh` 的实际 ArkWeb 就绪检测和部署断言。
+- **状态**：✅ 已修复
+
+### [2026-08-19] 插件市场安装因 Worker 显式继承 `--jitless` 被拒绝
+- **现象**：插件市场安装第三方插件时提示 `Initiated Worker with invalid execArgv flags: --jitless`。
+- **根因**：`dshmarket/lib/dsh-cli.js` 创建 Worker 时显式传入主进程的 `process.execArgv`；HarmonyOS 主进程的 `--jitless` 不属于 Worker 允许的 `execArgv`。
+- **修复**：`scripts/apply-dsh-ohos-adapt.sh` 的市场 Worker bridge 不再传入 `execArgv`，并把 Worker 的 stdout/stderr 回传给市场界面；`dsh plugin` 的 pnpm 执行继续走进程内 Worker，且使用应用私有临时目录与 HAP 内置 pnpm。
+- **验证**：2026-08-19 Release HAP 覆盖安装后，真机插件市场搜索并安装 `dsh-message-rail`；“已安装”计数变为 1，已安装页显示 `dsh-message-rail v0.1.3`、停用开关和卸载按钮。HiLog 未出现 `invalid execArgv`、`SIGSYS`、`jscrash`、`FATAL` 或 HDSH 未捕获异常；`scripts/ui-test-phone.sh 1 <hdc-target>` 全部通过。
+- **回归测试**：`scripts/ui-test-phone.sh` 4.5.6 检查市场 Worker 无显式 `execArgv`、pnpm Worker 使用私有临时目录和 HAP 内置 pnpm；通过可执行路径检查，避免依赖注释文本。
+- **状态**：✅ 已修复
+
+### [2026-08-18] 更换插件市场后旧 Web profile bundle 阻断 DSH 启动
+- **现象**：覆盖安装新市场后，HDSH 停留在“正在启动 DSH 运行时”；真机 `NodeLog` 报 Web profile 无法解析已卸载市场 bundle。
+- **根因**：`dsh-app-boot` 的初版 profile 迁移逻辑只追加 `dshmarket`，保留了旧市场的 bundle 条目；运行环境重建不会删除用户 profile 的 `package.json`，启动时加载该残留条目失败。
+- **修复**：`scripts/apply-dsh-ohos-adapt.sh` 的 v3 迁移先验证新市场包可解析，再从 Web profile bundles 移除旧市场条目并保留其余用户配置；环境版本提升至 `20260818-37` 强制覆盖安装后执行迁移。
+- **验证**：2026-08-18 Release `assembleHap` 成功，签名 HAP 覆盖安装到真机后 DSH server 就绪；`scripts/ui-test-phone.sh 1 <hdc-target>` 通过，页面主列、默认窗口比例和已部署的 v3 迁移实现均正常；HiLog 无 `jscrash`、`FATAL` 或 HDSH 未捕获异常。
+- **回归测试**：`scripts/ui-test-phone.sh` 断言 `dshmarket`、Worker bridge、旧包移除及 Web profile v3 迁移实现均已部署。
+- **状态**：✅ 已修复
+
+### [2026-08-18] 真机回归脚本错误读取应用私有 profile 与 Release 字节码
+- **现象**：真机 UI 回归已确认 DSH server 就绪和页面可见，脚本仍报告市场 profile 迁移与 ArkWeb DOM Storage 失败。
+- **根因**：`scripts/ui-test-phone.sh` 尝试通过 HDC shell 读取应用私有 `filesDir/home/.dsh/profiles/web/package.json`；同时以 `strings` 查找 Release `modules.abc` 中会被编译器移除的方法名，两个断言都会产生假阴性。
+- **修复**：市场检查改为验证 HAP 已部署的 dshmarket、Worker bridge、v3 迁移实现与旧市场包移除，并以本轮 DSH server 成功启动作为运行时证据；DOM Storage 改为检查参与本轮成功构建的 ArkWeb 源码配置。
+- **验证**：`bash -n scripts/ui-test-phone.sh` 通过；2026-08-18 真机执行 `scripts/ui-test-phone.sh 1 <hdc-target>` 全部通过。
+- **回归测试**：`scripts/ui-test-phone.sh` 的 4.5.4、4.5.6 断言。
+- **状态**：✅ 已修复
+
+### [2026-08-18] 内置插件市场替换为 dsh-market/dsh-market
+- **现象**：此前内置市场来自错误的上游仓库，与产品要求的 `dsh-market/dsh-market` 不一致。
+- **根因**：首次市场集成时使用了错误的 npm 包名和发布源。
+- **修复**：环境准备脚本固定安装 npm stable 包 `dshmarket@1.13.1`；Web profile bundle、依赖闭包、鸿蒙 Worker CLI bridge 和设备回归检查同步切换。Worker 启动时过滤 `--input-type` 参数，避免继承 ESM 测试上下文；环境版本提升至 `20260818-36`，覆盖安装后的首次启动会重建运行时并清理旧 fallback。
+- **验证**：rawfile 仅包含新市场；`dshmarket/lib/dsh-cli.js` 含 v8 Worker bridge；隔离 `DSH_HOME` 中执行 `dsh plugin --profile market-bridge add dshmarket@1.13.1` 返回 0，profile 依赖锁定为 `1.13.1`。
+- **状态**：✅ 已修复
+
+### [2026-08-18] dsh 插件 Worker 桥接无法安装市场插件
+- **现象**：`dsh plugin --profile <name> add <market-package>` 先后出现 `dirname is not defined`、`process.chdir() is not supported in workers` 与 pnpm 模块路径错误；其中 pnpm 加载失败时命令曾错误返回成功。
+- **根因**：`scripts/apply-dsh-ohos-adapt.sh` 将 `spawnSync` 改为 Worker 执行 pnpm 时，遗漏 `dirname` 与 `fileURLToPath` 导入；Worker 内调用 Node 明确禁止的 `process.chdir()`；pnpm 路径少回退一层目录；catch 分支未设置非零退出码。
+- **修复**：补齐导入；改用 pnpm 原生 `--dir <profileDir>` 参数；pnpm 路径改为 `../../../pnpm/dist/pnpm.cjs`；Worker 捕获加载异常后写入 `process.exitCode = 1`。市场插件调用复用此桥接，`DshBootstrap.ets` 环境版本提升至 `20260818-36`。
+- **验证**：在隔离 `DSH_HOME` 执行 `dsh plugin --profile market-bridge add dshmarket@1.13.1` 成功，pnpm 返回 0，profile 依赖锁定为 `1.13.1`。
+- **回归测试**：`scripts/ui-test-phone.sh` 断言已部署的 dsh-market 包、Cordis patch 与 Web profile bundle 同时存在；Worker 桥接由上述隔离命令复验。
+- **状态**：✅ 已修复
+
+### [2026-08-18] ArkWeb 未启用 DOM Storage 导致 DSH WebUI 持久化失败
+- **现象**：DSH 官方 WebUI 在 ArkWeb 中使用 `localStorage` 保存会话或界面状态时，控制台出现持久化相关失败，重新加载后状态无法可靠恢复。
+- **根因**：`HdshWebPage` 创建的 ArkWeb 组件未显式启用 DOM Storage，WebUI 的 `localStorage` 访问受限。
+- **修复**：在 `entry/src/main/ets/pages/hdsh/HdshWebPage.ets` 的 Web 组件配置中加入 `.domStorageAccess(true)`。
+- **验证**：使用重新签名的 HAP 覆盖安装至真机后，`EntryAbility` 保持前台，DSH 官方 WebUI 完整渲染；清理 HiLog 后未发现 `snapshot store`、`persistence failed`、`rehydration failed`、`jscrash` 或 `FATAL`。
+- **回归测试**：`scripts/ui-test-phone.sh` 断言已部署的 ArkWeb 页面源码启用 `domStorageAccess(true)`。
+- **状态**：✅ 已修复
+
 ### [2026-08-18] bash 子进程继承 cwd 导致 getcwd 权限错误
 - **现象**：bash 工具每次执行前输出 `getcwd: cannot access parent directories: Permission denied`；初始 cwd 下的 `pwd` 和无参数 `ls` 失败，显式 `cd` 到同一目录后恢复正常。
-- **根因**：HarmonyOS appspawn/FUSE 环境下，子进程继承的 `cwd` 可被内核解析，但 libc `getcwd()` 返回 EACCES。
-- **修复**：`scripts/apply-dsh-ohos-adapt.sh` 在 `dsh-bash-local` 的 `spawnSpec` 中为 `bash -c` 命令增加安全 shell 引号包裹的显式 `cd <workdir> 2>/dev/null || exit 1;` 前缀。
-- **验证**：适配脚本 Shell 语法检查通过；设备侧需重新生成 DSH 运行环境后复测 `pwd`、无参数 `ls` 及相对路径读写。
-- **状态**：🟡 待设备复验
+- **根因**：HarmonyOS appspawn/FUSE 环境下，子进程继承的 `cwd` 可被内核解析，但 libc `getcwd()` 返回 EACCES；此前适配脚本更新后没有提升 DSH 环境版本，覆盖安装沿用了已解压的旧运行环境，补丁未进入设备。
+- **修复**：`scripts/apply-dsh-ohos-adapt.sh` 在 `dsh-bash-local` 的 `spawnSpec` 中为 `bash -c` 命令增加安全 shell 引号包裹的显式 `cd <workdir> 2>/dev/null || exit 1;` 前缀；`DshBootstrap.ets` 的 `ENV_VERSION` 提升到 `20260818-24`，强制覆盖安装后重新解压运行环境。
+- **验证**：冷启动日志证实当前已部署的旧副本缺少 `spawnArgv` 标记，且包含 `getcwd` 提示；重新生成 rawfile、构建并覆盖安装后复测 `pwd`、无参数 `ls` 及相对路径读写。
+- **回归测试**：`scripts/ui-test-phone.sh` 断言已部署的 `dsh-bash-local` 包含 cwd 恢复标记。
+- **状态**：🟡 待重新生成环境并设备复验
 
 ### [2026-08-18] 默认启动窗口被强制缩为手机长条
 - **现象**：2in1 真机启动 HDSH 后，WebUI 固定为窄而高的浮窗，无法使用设备默认窗口比例。
@@ -159,3 +231,11 @@
 - **修复**：zh_CN 10 处 + en_US 13 处 NGF → HDSH 全部替换
 - **验证**：资源 string.json 无 NGF 残留、HAP 部署成功
 - **状态**：✅ 已修复
+
+### [2026-08-18] Release 构建因框架混淆规则文件缺失失败
+- **现象**：执行 `assembleHap -p module=entry@default --mode module -p buildMode=release` 时，`ngf_framework` 的 `CompileArkTS` 失败，报错 `00304036 Not Found`。
+- **根因**：`ngf_framework/build-profile.json5` 启用了混淆，并声明了 `./obfuscation-rules.txt` 和 `./consumer-rules.txt`，仓库中缺少这两个文件。
+- **修复**：补齐 `ngf_framework/obfuscation-rules.txt` 与 `ngf_framework/consumer-rules.txt`；前者沿用现有模块的 Release 混淆选项，后者明确没有额外的消费者保留规则。
+- **验证**：Release `assembleHap` 于 2026-08-18 成功完成；签名配置绑定后生成 `entry-default-signed.hap`，并已通过 HDC 覆盖安装到真机、启动 `EntryAbility`。
+- **遗留**：签名材料必须保持在仓库外的本机安全位置；`build-profile.json5` 中的签名敏感字段不得提交或推送到公开仓库。
+- **状态**：✅ 已修复并完成真机安装验证
